@@ -1,0 +1,147 @@
+#!/bin/sh
+
+# Summary
+#
+# Adjust fan speed by percentage when CPU/GPU is between user set
+# Min and Max temperatures.
+#
+# Notes
+#
+# Temp can be gleaned from the sysfs termal_zone files and are in 
+# units millidegrees meaning a reading of 30000 is equal to 30.000 C
+#
+# Fan speed is read and controlled by he pwm_fan module and can be 
+# read and set from a sysfs file as well. The value can be set from 0 (off) 
+# to 255 (max). It defaults to 255 at start
+
+
+## Set Points
+
+# CPU Temp set points
+MIN_TEMP=40 # Min desired CPU temp
+MAX_TEMP=60 # Max desired CPU temp
+
+
+# Fan Speeds set points 
+FAN_OFF=0   	# Fan is off 
+FAN_MIN=38  	# Some fans need a minimum of 15% to start from a dead stop.
+FAN_MAX=255 	# Max cycle for fan
+
+# Frequency
+CYCLE_FREQ=6            # How often should we check, in seconds
+SHORT_CYCLE_PERCENT=20 	# If we are shutting on or of more than this percent of the
+			# time, just run at min rather than shutting off
+
+## Sensor and Control files
+
+# CPU and GPU sysfs locations
+CPU=/sys/class/thermal/thermal_zone0/temp
+GPU=/sys/class/thermal/thermal_zone1/temp
+
+# Fan Control files
+FAN2=/sys/devices/platform/pwm-fan/hwmon/hwmon2/pwm1
+FAN3=/sys/devices/platform/pwm-fan/hwmon/hwmon3/pwm1
+
+
+
+## Logic 
+
+# The fan control file isn't available until the module loads and
+# is unpredictable in path. Wait until it comes up
+
+FAN=""
+while [[ -z $FAN ]];do 
+	[[ -f $FAN2 ]] && FAN=$FAN2 
+	[[ -f $FAN3 ]] && FAN=$FAN3 
+	[[ -z $FAN ]] && sleep 1
+done
+
+# The sensors are in millidegrees so adjust the user
+# set points to the same units
+
+MIN_TEMP=$(( $MIN_TEMP * 1000 ))
+MAX_TEMP=$(( $MAX_TEMP * 1000 ))
+
+
+# Short cycle detection requires us to track the number
+# of on-off flips to cycles
+
+CYCLES=0
+FLIPS=0
+SHORT_CYCLING=""
+
+while true; do
+
+	CYCLES=$((CYCLES+1))
+
+	# Set TEMP to the highest GPU/CPU Temp
+	TEMP=""
+	read TEMP_CPU < $CPU
+	read TEMP_GPU < $GPU
+	[[ $TEMP_CPU -gt $TEMP_GPU ]] && TEMP=$TEMP_CPU || TEMP=$TEMP_GPU
+
+	# How many degress above or below our min threshold are we?
+	DEGREES=$(( $TEMP-$MIN_TEMP ))
+
+	# What percent of the range between min and max is that?
+	RANGE=$(( $MAX_TEMP-$MIN_TEMP ))
+	PERCENT=$(( (100*$DEGREES/$RANGE) ))
+
+	# What number between 0 and 255 is that percent?
+	FAN_SPEED=$(( (255*$PERCENT)/100 ))
+
+	# Override the calculated speed for some special cases
+	if [[ $FAN_SPEED -le $FAN_OFF ]]; then			# Set anything 0 or less to 0
+	        FAN_SPEED=$FAN_OFF
+	elif [[ $FAN_SPEED -lt $FAN_MIN ]]; then		# Set anything below the min to min
+	        FAN_SPEED=$FAN_MIN
+	elif [[ $FAN_SPEED -ge $FAN_MAX ]]; then		# Set anything above the max to max 
+	        FAN_SPEED=$FAN_MAX
+	fi
+
+	# On this cycle, did we just flip on or off?
+	read -r OLD_FAN_SPEED < $FAN
+	if ( 	( [[ $OLD_FAN_SPEED -eq 0 ]] && [[ $FAN_SPEED -ne 0 ]] ) || \
+		( [[ $OLD_FAN_SPEED -ne 0 ]] && [[ $FAN_SPEED -eq 0 ]] ) ); then
+		FLIPS=$((FLIPS+1))
+	fi
+
+	# Every 10 cycles, if we haven't already tripped the short-cycle detection,
+	# check to see if we are short-cycling. Reset the window if not.
+	if [[ $CYCLES -ge 10 ]] && [[ ! $SHORT_CYCLING ]]; then
+		FLIP_PERCENT=$(( 100*$FLIPS/$CYCLES ))
+		if [[ $FLIP_PERCENT -gt $SHORT_CYCLE_PERCENT ]]; then
+			SHORT_CYCLING=1
+			echo "Short-cycling detected."
+			echo "Fan will no longer power all the way off."
+		else	
+			CYCLES=0;FLIPS=0
+		fi
+	fi
+
+	# If we are short-cycling and would turn the fan off, just set to min
+	if [[ $SHORT_CYCLING ]] && [[ $FAN_SPEED -le $FAN_MIN ]]; then
+		FAN_SPEED=$FAN_MIN
+	fi	
+
+	# Every so often, exit short cycle mode to see if conditions have changed
+	if [[ $SHORT_CYCLING ]] && [[ $CYCLES -gt 10000 ]]; then  # Roughly half a day
+		echo "Exiting short-cycling"
+		SHORT_CYCLING=""
+	fi
+
+	# Write that to the fan speed control file
+	echo $FAN_SPEED > $FAN
+
+	# Log the stats every once in a while
+	#[[ $((CYCLES % 10 )) -eq 0 ]] && echo "Cycle $CYCLES and temp was $TEMP fan set to $FAN_SPEED"
+	sleep $CYCLE_FREQ
+
+done
+
+# Also look at drive temps. The sysfs filesystem isn't useful for 
+# all drives on RockPro64 so use smartctl instead
+
+#ls -1 /dev/sd? | xargs -n1 smartctl -A | egrep ^194 | awk '{print $4}'
+
+
